@@ -30,7 +30,7 @@ from .initialize import get_model_parallel_rank
 from .initialize import get_model_parallel_src_rank
 from .initialize import get_model_parallel_world_size
 from .initialize import initialize_model_parallel
-from .initialize import model_parallel_is_initialized
+from .initialize import model_parallel_is_initialized, weight_sharding_, weight_sharding, WeightShardingWrapper, WeightShardingContext
 
 from .layers import ColumnParallelLinear
 from .layers import ParallelEmbedding

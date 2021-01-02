@@ -15,13 +15,16 @@
 
 import torch
 
-from .initialize import get_model_parallel_group
+from .initialize import get_model_parallel_group, weight_sharding
 from .utils import split_tensor_along_last_dim
 
 from deepspeed.utils import event_manager
 
 def _reduce(input_):
     """All-reduce the the input tensor across model parallel group."""
+    if weight_sharding():
+        return input_
+
     group = get_model_parallel_group()
 
     # Bypass the function if we are using only 1 GPU.
@@ -38,6 +41,9 @@ def _reduce(input_):
 def _split(input_):
     """Split the tensor along its last dimension and keep the
     corresponding slice."""
+    if weight_sharding():
+        return input_
+
     group = get_model_parallel_group()
 
     # Bypass the function if we are using only 1 GPU.
@@ -58,6 +64,9 @@ def _split(input_):
 
 def _gather(input_):
     """Gather tensors and concatinate along the last dimension."""
+    if weight_sharding():
+        return input_
+
     group = get_model_parallel_group()
 
     # Bypass the function if we are using only 1 GPU.

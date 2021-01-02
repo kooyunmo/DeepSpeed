@@ -28,7 +28,7 @@ from torch.nn.parameter import Parameter
 from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
 
 from .initialize import get_model_parallel_rank
-from .initialize import get_model_parallel_world_size
+from .initialize import get_model_parallel_world_size, weight_sharding
 from .mappings import copy_to_model_parallel_region
 from .mappings import gather_from_model_parallel_region
 from .mappings import reduce_from_model_parallel_region
@@ -48,7 +48,7 @@ def _initialize_affine_weight(weight, output_size, input_size,
     the relevant chunk."""
     # If we only use 1 process for model parallelism, bypass scatter.
     world_size = get_model_parallel_world_size()
-    if world_size == 1:
+    if world_size == 1 or weight_sharding():
         init_method(weight)
         if return_master_weight:
             return weight
@@ -97,11 +97,14 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.scale_grad_by_freq = False
         self.sparse = False
         self._weight = None
-        # Divide the weight matrix along the vocaburaly dimension.
-        self.vocab_start_index, self.vocab_end_index = \
-            VocabUtility.vocab_range_from_global_vocab_size(
-                self.num_embeddings, get_model_parallel_rank(),
-                get_model_parallel_world_size())
+        if weight_sharding():
+            self.vocab_start_index, self.vocab_end_index = 0, self.num_embeddings
+        else:
+            # Divide the weight matrix along the vocaburaly dimension.
+            self.vocab_start_index, self.vocab_end_index = \
+                VocabUtility.vocab_range_from_global_vocab_size(
+                    self.num_embeddings, get_model_parallel_rank(),
+                    get_model_parallel_world_size())
         self.num_embeddings_per_partition = self.vocab_end_index - \
                                             self.vocab_start_index
 
@@ -157,10 +160,13 @@ class ParallelEmbedding(torch.nn.Module):
         self.scale_grad_by_freq = False
         self.sparse = False
         self._weight = None
-        # Divide the weight matrix along the embedding dimension.
-        world_size = get_model_parallel_world_size()
+        if weight_sharding():
+            world_size = 1
+        else:
+            # Divide the weight matrix along the embedding dimension.
+            world_size = get_model_parallel_world_size()
         self.embedding_dim_per_partition = divide(self.embedding_dim,
-                                                  world_size)
+                                                world_size)
 
         # Allocate weights.
         self.weight = Parameter(torch.Tensor(self.num_embeddings,
@@ -211,8 +217,11 @@ class ColumnParallelLinear(torch.nn.Module):
         self.input_size = input_size
         self.output_size = output_size
         self.gather_output = gather_output
-        # Divide the weight matrix along the last dimension.
-        world_size = get_model_parallel_world_size()
+        if weight_sharding():
+            world_size = 1
+        else:
+            # Divide the weight matrix along the last dimension.
+            world_size = get_model_parallel_world_size()
         self.output_size_per_partition = divide(output_size, world_size)
 
         # Parameters.
@@ -285,8 +294,11 @@ class RowParallelLinear(torch.nn.Module):
         self.input_size = input_size
         self.output_size = output_size
         self.input_is_parallel = input_is_parallel
-        # Divide the weight matrix along the last dimension.
-        world_size = get_model_parallel_world_size()
+        if weight_sharding():
+            world_size = 1
+        else:
+            # Divide the weight matrix along the last dimension.
+            world_size = get_model_parallel_world_size()
         self.input_size_per_partition = divide(input_size, world_size)
 
         # Parameters.

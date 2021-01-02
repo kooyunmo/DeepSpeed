@@ -21,7 +21,7 @@ import torch
 import torch.nn.init as init
 from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
 
-from .initialize import get_model_parallel_world_size
+from .initialize import get_model_parallel_world_size, WeightShardingWrapper
 from .layers import ColumnParallelLinear
 from .layers import RowParallelLinear
 from .mappings import gather_from_model_parallel_region
@@ -68,8 +68,11 @@ class GPT2ParallelSelfAttention(torch.nn.Module):
         # Set output layer initialization if not provided.
         if output_layer_init_method is None:
             output_layer_init_method = init_method
-        # Per attention head and per partition values.
-        world_size = get_model_parallel_world_size()
+        if weight_sharding():
+            world_size = 1
+        else:
+            # Per attention head and per partition values.
+            world_size = get_model_parallel_world_size()
         self.hidden_size_per_partition = divide(hidden_size, world_size)
         self.hidden_size_per_attention_head = divide(hidden_size,
                                                      num_attention_heads)
@@ -369,22 +372,31 @@ class GPT2ParallelTransformer(torch.nn.Module):
         if use_scaled_init_for_output_weights:
             output_layer_init_method = scaled_init_method(init_method_std,
                                                           num_layers)
-        def get_layer():
-            return GPT2ParallelTransformerLayer(
-                hidden_size,
-                num_attention_heads,
-                attention_dropout_prob,
-                output_dropout_prob,
-                layernorm_epsilon,
-                unscaled_init_method(init_method_std),
-                output_layer_init_method=output_layer_init_method)
-
+        def get_layer(idx):
+            return WeightShardingWrapper(
+                GPT2ParallelTransformerLayer(
+                    hidden_size,
+                    num_attention_heads,
+                    attention_dropout_prob,
+                    output_dropout_prob,
+                    layernorm_epsilon,
+                    unscaled_init_method(init_method_std),
+                    output_layer_init_method=output_layer_init_method
+                ),
+                debug_name=f"layer_{idx}"
+            )
         # Transformer layers.
         self.layers = torch.nn.ModuleList(
-            [get_layer() for _ in range(num_layers)])
+            [get_layer(idx) for idx in range(num_layers)])
+        
+        for prev, next in zip(self.layers, self.layers[1:]):
+            prev.next = next
+            next.prev = prev
 
         # Final layer norm before output.
-        self.final_layernorm = LayerNorm(hidden_size, eps=layernorm_epsilon)
+        self.final_layernorm = WeightShardingWrapper(LayerNorm(hidden_size, eps=layernorm_epsilon), debug_name="final_layernorm")
+        self.final_layernorm.prev = self.layers[-1]
+        self.layers[-1].next = self.final_layernorm
 
         if deepspeed.checkpointing.is_configured():
             global get_cuda_rng_tracker, checkpoint
@@ -455,8 +467,11 @@ class BertParallelSelfAttention(torch.nn.Module):
         self.num_attention_heads = num_attention_heads
         self.dropout_prob = dropout_prob
         self.output_parallel = output_parallel
-        # Per attention head and per partition values.
-        world_size = get_model_parallel_world_size()
+        if weight_sharding():
+            world_size = 1
+        else:
+            # Per attention head and per partition values.
+            world_size = get_model_parallel_world_size()
         self.hidden_size_per_partition = divide(hidden_size, world_size)
         self.hidden_size_per_attention_head = divide(hidden_size,
                                                      num_attention_heads)

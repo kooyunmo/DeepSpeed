@@ -155,6 +155,9 @@ def get_learning_rate_scheduler(optimizer, args):
 
     return lr_scheduler
 
+def setup_weight_sharding(args):
+    mpu.weight_sharding_(bool(args.weight_sharding))
+
 
 def setup_model_and_optimizer(args):
     """Setup model and optimizer."""
@@ -662,6 +665,9 @@ def main():
         # Data stuff.
         train_data, val_data, test_data, args.vocab_size, \
             args.eod_token = get_train_val_test_data(args)
+        
+        # Weight sharding PoC (AC)
+        setup_weight_sharding(args)
 
         # Model, optimizer, and learning rate.
         model, optimizer, lr_scheduler = setup_model_and_optimizer(args)

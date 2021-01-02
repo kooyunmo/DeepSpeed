@@ -64,6 +64,7 @@ def add_model_config_args(parser):
                                    help='Run optimizer on CPU')
     group.add_argument('--cpu_torch_adam', action='store_true',
                                    help='Use Torch Adam as optimizer on CPU.')
+    group.add_argument('--weight-sharding', action='store_true', default=False, help="Weight Sharding (Proof-Of-Concept by alchan)")
 
     return parser
 
