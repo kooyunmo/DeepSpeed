@@ -21,7 +21,7 @@ import torch
 import torch.nn.init as init
 from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
 
-from .initialize import get_model_parallel_world_size, WeightShardingWrapper
+from .initialize import get_model_parallel_world_size, WeightShardingWrapper, weight_sharding
 from .layers import ColumnParallelLinear
 from .layers import RowParallelLinear
 from .mappings import gather_from_model_parallel_region
@@ -390,13 +390,13 @@ class GPT2ParallelTransformer(torch.nn.Module):
             [get_layer(idx) for idx in range(num_layers)])
         
         for prev, next in zip(self.layers, self.layers[1:]):
-            prev.next = next
-            next.prev = prev
+            prev.set_next(next)
+            next.set_prev(prev)
 
         # Final layer norm before output.
         self.final_layernorm = WeightShardingWrapper(LayerNorm(hidden_size, eps=layernorm_epsilon), debug_name="final_layernorm")
-        self.final_layernorm.prev = self.layers[-1]
-        self.layers[-1].next = self.final_layernorm
+        self.final_layernorm.set_prev(self.layers[-1])
+        self.layers[-1].set_next(self.final_layernorm)
 
         if deepspeed.checkpointing.is_configured():
             global get_cuda_rng_tracker, checkpoint
