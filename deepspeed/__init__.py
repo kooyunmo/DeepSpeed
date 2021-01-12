@@ -118,14 +118,15 @@ def initialize(args,
                                  collate_fn=collate_fn,
                                  config_params=config_params)
     else:
-        assert mpu is None, "mpu must be None with pipeline parallelism"
+        # We do need an external MPU for our Megatron-LM example. (commented out by AC)
+        # assert mpu is None, "mpu must be None with pipeline parallelism"
         engine = PipelineEngine(args=args,
                                 model=model,
                                 optimizer=optimizer,
                                 model_parameters=model_parameters,
                                 training_data=training_data,
                                 lr_scheduler=lr_scheduler,
-                                mpu=model.mpu(),
+                                mpu=mpu or model.mpu(),
                                 dist_init_required=dist_init_required,
                                 collate_fn=collate_fn,
                                 config_params=config_params)
