@@ -16,10 +16,12 @@
 """Transformer."""
 
 import math
+from typing import List, Tuple
 
 import torch
 import torch.nn.init as init
 from apex.normalization.fused_layer_norm import FusedLayerNorm as LayerNorm
+from deepspeed.runtime.pipe import LayerSpec
 
 from .initialize import get_model_parallel_world_size
 from .layers import ColumnParallelLinear
@@ -278,7 +280,7 @@ class GPT2ParallelTransformerLayer(torch.nn.Module):
             init_method,
             output_layer_init_method=output_layer_init_method)
 
-    def forward(self, hidden_states, ltor_mask):
+    def forward(self, hidden_states, ltor_mask) -> torch.Tensor:
         # hidden_states: [b, s, h]
         # ltor_mask: [1, 1, s, s]
 
@@ -315,6 +317,23 @@ def scaled_init_method(sigma, num_layers):
     return init_
 
 
+class ChkptGPT2ParallelTransformerLayer(GPT2ParallelTransformerLayer):
+    def __init__(self, checkpoint_activations=True, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.checkpoint_activations = checkpoint_activations
+
+    def forward(self, hidden_states, attention_mask) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.checkpoint_activations:
+            return deepspeed.checkpointing.checkpoint(super().forward, hidden_states, attention_mask), attention_mask
+        else:
+            return super().forward(hidden_states, attention_mask), attention_mask
+
+
+class DummyMaskLayerNorm(LayerNorm):
+    def forward(self, h, attention_mask):
+        return super().forward(h)
+
+
 class GPT2ParallelTransformer(torch.nn.Module):
     """GPT-2 transformer.
 
@@ -349,6 +368,36 @@ class GPT2ParallelTransformer(torch.nn.Module):
                                             scaling for the output weights (
                                             output of self attention and mlp).
     """
+
+    @classmethod
+    def layer_specs(cls, num_layers,
+                    hidden_size,
+                    num_attention_heads,
+                    attention_dropout_prob,
+                    output_dropout_prob,
+                    checkpoint_activations,
+                    checkpoint_num_layers=1,
+                    layernorm_epsilon=1.0e-5,
+                    init_method_std=0.02) -> List[LayerSpec]:
+        assert checkpoint_num_layers == 1, "checkpoint_num_layers should be 1 (for now)"
+        return [
+            *[
+                LayerSpec(
+                    ChkptGPT2ParallelTransformerLayer,
+                    hidden_size,
+                    num_attention_heads,
+                    attention_dropout_prob,
+                    output_dropout_prob,
+                    layernorm_epsilon,
+                    unscaled_init_method(init_method_std),
+                    output_layer_init_method=scaled_init_method(init_method_std, num_layers),
+                    checkpoint_activations=checkpoint_activations,
+                )
+                for _ in range(num_layers)
+            ],
+            LayerSpec(DummyMaskLayerNorm, eps=layernorm_epsilon),
+        ]
+
     def __init__(self,
                  num_layers,
                  hidden_size,

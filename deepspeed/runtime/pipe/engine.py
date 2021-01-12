@@ -476,6 +476,7 @@ class PipelineEngine(DeepSpeedEngine):
         else:
             assert torch.is_tensor(batch[0][0])
             if batch[0][0].size(0) != self.micro_batch_size:
+                print(f'size mismatch: {batch[0][0].size(0)} mb: {self.micro_batch_size}')
                 return self._next_batch()
 
         return batch
