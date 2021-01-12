@@ -18,6 +18,7 @@
 import torch
 import torch.nn.functional as F
 
+from utils import print_rank_0
 import mpu
 
 
@@ -32,6 +33,47 @@ def init_method_normal(std=0.02):
     return init_
 
 
+def get_deepspeed_config(args):
+    if hasattr(args, 'deepspeed_config') and args.deepspeed_config:
+        from deepspeed import DeepSpeedConfig
+        return DeepSpeedConfig(args.deepspeed_config)
+    else:
+        raise RuntimeError('deepspeed_config is not found in args.')
+
+
+def get_sparse_attention_config(args, num_heads):
+    if args.deepspeed_sparse_attention:
+        ds_config = get_deepspeed_config(args)
+        if hasattr(ds_config,
+                   'sparse_attention') and ds_config.sparse_attention:
+            sa_config = ds_config.sparse_attention
+            sa_mode = sa_config.get('mode')
+            if (sa_mode == 'dense'):
+                from deepspeed.ops.sparse_attention import DenseSparsityConfig as STConfig
+            elif (sa_mode == 'fixed'):
+                from deepspeed.ops.sparse_attention import FixedSparsityConfig as STConfig
+            elif (sa_mode == 'bigbird'):
+                from deepspeed.ops.sparse_attention import BigBirdSparsityConfig as STConfig
+            elif (sa_mode == 'bslongformer'):
+                from deepspeed.ops.sparse_attention import BSLongformerSparsityConfig as STConfig
+            elif (sa_mode == 'variable'):
+                from deepspeed.ops.sparse_attention import VariableSparsityConfig as STConfig
+            else:
+                raise NotImplementedError(
+                    f'Given sparsity mode, {sa_mode}, has not been implemented yet!'
+                )
+            del sa_config['mode']
+            return STConfig(num_heads=num_heads, **sa_config)
+        else:
+            from deepspeed.ops.sparse_attention import FixedSparsityConfig as STConfig
+            print(
+                'deepspeed sparse attention is not set; Fixed sparsity is used as default.'
+            )
+            return STConfig(num_heads=num_heads)
+    else:
+        return None
+
+
 class GPT2Model(torch.nn.Module):
     """GPT-2 Language model.
 
@@ -40,6 +82,7 @@ class GPT2Model(torch.nn.Module):
     """
 
     def __init__(self,
+                 args,
                  num_layers,
                  vocab_size,
                  hidden_size,
@@ -50,7 +93,8 @@ class GPT2Model(torch.nn.Module):
                  max_sequence_length,
                  checkpoint_activations,
                  checkpoint_num_layers=1,
-                 parallel_output=True):
+                 parallel_output=True,
+                 ):
 
         super(GPT2Model, self).__init__()
 
@@ -71,14 +115,18 @@ class GPT2Model(torch.nn.Module):
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
 
+        self.sparse_attention_config = get_sparse_attention_config(args, num_attention_heads) #TODO
+
         # Transformer
-        self.transformer = mpu.GPT2ParallelTransformer(num_layers,
+        self.transformer = mpu.GPT2ParallelTransformer(self.sparse_attention_config,
+                                                       num_layers,
                                                        hidden_size,
                                                        num_attention_heads,
                                                        attention_dropout_prob,
                                                        output_dropout_prob,
                                                        checkpoint_activations,
-                                                       checkpoint_num_layers)
+                                                       checkpoint_num_layers
+                                                       ) #TODO
 
     def forward(self, input_ids, position_ids, attention_mask):
 

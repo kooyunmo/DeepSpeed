@@ -34,6 +34,8 @@ from .random import get_cuda_rng_tracker
 from .utils import divide
 from .utils import split_tensor_along_last_dim
 
+from deepspeed.ops.sparse_attention import SparseSelfAttention     #TODO
+
 
 class GPT2ParallelSelfAttention(torch.nn.Module):
     """Parallel self-attention layer for GPT2.
@@ -61,9 +63,10 @@ class GPT2ParallelSelfAttention(torch.nn.Module):
         b: batch size
         s: sequence length
     """
-    def __init__(self, hidden_size, num_attention_heads,
+    def __init__(self, sparsity_config, hidden_size, num_attention_heads,
                  attention_dropout_prob, output_dropout_prob,
-                 init_method, output_layer_init_method=None):
+                 init_method, output_layer_init_method=None,
+                 ):
         super(GPT2ParallelSelfAttention, self).__init__()
         # Set output layer initialization if not provided.
         if output_layer_init_method is None:
@@ -91,6 +94,8 @@ class GPT2ParallelSelfAttention(torch.nn.Module):
                                        input_is_parallel=True,
                                        init_method=output_layer_init_method)
         self.output_dropout = torch.nn.Dropout(output_dropout_prob)
+
+        self.sparse_self_attention = SparseSelfAttention(sparsity_config)   #TODO
 
         if deepspeed.checkpointing.is_configured():
             global get_cuda_rng_tracker, checkpoint
@@ -123,6 +128,7 @@ class GPT2ParallelSelfAttention(torch.nn.Module):
         key_layer = self._transpose_for_scores(mixed_key_layer)
         value_layer = self._transpose_for_scores(mixed_value_layer)
 
+        """
         # Raw attention scores. [b, np, s, s]
         attention_scores = torch.matmul(query_layer,
                                         key_layer.transpose(-1, -2))
@@ -142,6 +148,13 @@ class GPT2ParallelSelfAttention(torch.nn.Module):
         # Context layer.
         # [b, np, s, hn]
         context_layer = torch.matmul(attention_probs, value_layer)
+        """
+
+        context_layer = self.sparse_self_attention(query_layer,
+                                                   key_layer,
+                                                   value_layer,
+                                                   attn_mask=None)
+
         # [b, s, np, hn]
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + \
@@ -243,13 +256,15 @@ class GPT2ParallelTransformerLayer(torch.nn.Module):
                                   use `init_method`.
     """
     def __init__(self,
+                 sparse_attention_config,
                  hidden_size,
                  num_attention_heads,
                  attention_dropout_prob,
                  output_dropout_prob,
                  layernorm_epsilon,
                  init_method,
-                 output_layer_init_method=None):
+                 output_layer_init_method=None
+                 ):  #TODO
         super(GPT2ParallelTransformerLayer, self).__init__()
         # Set output layer initialization if not provided.
         if output_layer_init_method is None:
@@ -260,12 +275,14 @@ class GPT2ParallelTransformerLayer(torch.nn.Module):
 
         # Self attention.
         self.attention = GPT2ParallelSelfAttention(
+            sparse_attention_config,
             hidden_size,
             num_attention_heads,
             attention_dropout_prob,
             output_dropout_prob,
             init_method,
-            output_layer_init_method=output_layer_init_method)
+            output_layer_init_method=output_layer_init_method
+            )    #TODO
 
         # Layernorm on the input data.
         self.post_attention_layernorm = LayerNorm(hidden_size,
@@ -350,6 +367,7 @@ class GPT2ParallelTransformer(torch.nn.Module):
                                             output of self attention and mlp).
     """
     def __init__(self,
+                 sparse_attention_config,   #TODO
                  num_layers,
                  hidden_size,
                  num_attention_heads,
@@ -371,13 +389,15 @@ class GPT2ParallelTransformer(torch.nn.Module):
                                                           num_layers)
         def get_layer():
             return GPT2ParallelTransformerLayer(
+                sparse_attention_config,
                 hidden_size,
                 num_attention_heads,
                 attention_dropout_prob,
                 output_dropout_prob,
                 layernorm_epsilon,
                 unscaled_init_method(init_method_std),
-                output_layer_init_method=output_layer_init_method)
+                output_layer_init_method=output_layer_init_method
+                )    #TODO
 
         # Transformer layers.
         self.layers = torch.nn.ModuleList(

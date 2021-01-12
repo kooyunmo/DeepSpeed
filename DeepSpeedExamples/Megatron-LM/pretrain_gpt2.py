@@ -59,7 +59,8 @@ def get_model(args):
     """Build the model."""
 
     print_rank_0('building GPT2 model ...')
-    model = GPT2Model(num_layers=args.num_layers,
+    model = GPT2Model(args=args,
+                      num_layers=args.num_layers,
                       vocab_size=args.vocab_size,
                       hidden_size=args.hidden_size,
                       num_attention_heads=args.num_attention_heads,
@@ -69,7 +70,8 @@ def get_model(args):
                       max_sequence_length=args.max_position_embeddings,
                       checkpoint_activations=args.checkpoint_activations,
                       checkpoint_num_layers=args.checkpoint_num_layers,
-                      parallel_output=True)
+                      parallel_output=True
+                      )
 
     if mpu.get_data_parallel_rank() == 0:
         print(' > number of parameters on model parallel rank {}: {}'.format(
