@@ -10,7 +10,7 @@ SEQ_LENGTH=${SEQ_LENGTH:-1024}
 #export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 NUM_WORKERS=1
-NUM_GPUS_PER_WORKER=6
+NUM_GPUS_PER_WORKER=8
 
 script_path=$(realpath $0)
 script_dir=$(dirname $script_path)
