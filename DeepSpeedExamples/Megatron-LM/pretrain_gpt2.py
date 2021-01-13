@@ -101,7 +101,7 @@ def get_model(args):
     if pipeline_enabled(args):
         layer_specs = GPT2Model.layer_specs(**model_kwargs)
         model = PipelineModule(layers=layer_specs, topology=get_topology(args),
-                               loss_fn=get_loss, partition_method='parameter', num_stages=args.num_stages)
+                               loss_fn=get_loss, partition_method='parameters', num_stages=args.num_stages)
     else:
         model = GPT2Model(**model_kwargs)
 
