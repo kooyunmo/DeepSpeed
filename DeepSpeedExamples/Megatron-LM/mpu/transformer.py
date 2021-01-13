@@ -95,8 +95,10 @@ class GPT2ParallelSelfAttention(torch.nn.Module):
                                        init_method=output_layer_init_method)
         self.output_dropout = torch.nn.Dropout(output_dropout_prob)
 
+        if sparsity_config is not None:
+            self.sparse_self_attention = SparseSelfAttention(sparsity_config)   #TODO
+        
         self.sparsity_config = sparsity_config
-        #self.sparse_self_attention = SparseSelfAttention(sparsity_config)   #TODO
 
         if deepspeed.checkpointing.is_configured():
             global get_cuda_rng_tracker, checkpoint
@@ -129,15 +131,17 @@ class GPT2ParallelSelfAttention(torch.nn.Module):
         key_layer = self._transpose_for_scores(mixed_key_layer)
         value_layer = self._transpose_for_scores(mixed_value_layer)
 
-        if self.sparsity_config is None:    # use non-sparse attention
+
+        if self.sparsity_config is None:
             # Raw attention scores. [b, np, s, s]
             attention_scores = torch.matmul(query_layer,
-                                        key_layer.transpose(-1, -2))
+                                            key_layer.transpose(-1, -2))
+
             attention_scores = attention_scores / math.sqrt(
                 self.hidden_size_per_attention_head)
             # Apply the left to right attention mask.
             attention_scores = torch.mul(attention_scores, ltor_mask) - \
-                           10000.0 * (1.0 - ltor_mask)
+                            10000.0 * (1.0 - ltor_mask)
 
             # Attention probabilities. [b, np, s, s]
             attention_probs = torch.nn.Softmax(dim=-1)(attention_scores)
@@ -149,14 +153,12 @@ class GPT2ParallelSelfAttention(torch.nn.Module):
             # Context layer.
             # [b, np, s, hn]
             context_layer = torch.matmul(attention_probs, value_layer)
-        
-        else:   # use sparse attention
-            sparse_self_attention = SparseSelfAttention(sparsity_config)
-            context_layer = sparse_self_attention(query_layer,
-                                                   key_layer,
-                                                   value_layer,
-                                                   attn_mask=None)
 
+        else:
+            context_layer = self.sparse_self_attention(query_layer,
+                                                    key_layer,
+                                                    value_layer,
+                                                    attn_mask=None)
 
         # [b, s, np, hn]
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
