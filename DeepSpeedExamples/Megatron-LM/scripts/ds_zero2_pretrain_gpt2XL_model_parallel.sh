@@ -17,7 +17,6 @@ config_json="$script_dir/ds_zero2_pretrain_gpt2XL_model_parallel_config.json"
 gpt_options=" \
        --model-parallel-size ${MP_SIZE} \
        --num-stages ${PP_SIZE} \
-       --batch-size 16 \
        --num-layers 48 \
        --hidden-size 1536 \
        --num-attention-heads 24 \

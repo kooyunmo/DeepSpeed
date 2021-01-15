@@ -102,8 +102,8 @@ def add_training_args(parser):
 
     group = parser.add_argument_group('train', 'training configurations')
 
-    group.add_argument('--batch-size', type=int, default=4,
-                       help='Data Loader batch size')
+    #group.add_argument('--batch-size', type=int, default=4,
+    #                   help='Data Loader batch size') # Deprecated
     group.add_argument('--weight-decay', type=float, default=0.01,
                        help='weight decay coefficient for L2 regularization')
     group.add_argument('--checkpoint-activations', action='store_true',

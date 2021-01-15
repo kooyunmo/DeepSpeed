@@ -741,12 +741,14 @@ def main():
         # Random seeds for reproducability.
         set_random_seed(args.seed)
 
-        # Data stuff.
-        train_data, val_data, test_data, args.vocab_size, \
-            args.eod_token = get_train_val_test_data(args)
-
         # Model, optimizer, and learning rate.
         model, optimizer, lr_scheduler = setup_model_and_optimizer(args)
+
+        # Data stuff.
+        # Note (AC): got rid of confusing separate "batch_size" option. Use train_batch_size and num_accumulation_steps option instead.
+        args.batch_size = model.train_micro_batch_size_per_gpu()
+        train_data, val_data, test_data, args.vocab_size, \
+            args.eod_token = get_train_val_test_data(args)
 
 
         # Resume data loader if necessary.
