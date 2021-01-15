@@ -229,6 +229,7 @@ def add_data_args(parser):
     group.add_argument('--model-parallel-size', type=int, default=1,
                        help='size of the model parallel.')
     group.add_argument('--num-stages', type=int, default=1, help='Number of Pipeline Parallel stages (by AC)')
+    group.add_argument('--force-pp', action='store_true', default=False, help='Use PipelineEngine even when num-stages is 1')
     group.add_argument('--shuffle', action='store_true',
                        help='Shuffle data. Shuffling is deterministic '
                        'based on seed and current epoch.')

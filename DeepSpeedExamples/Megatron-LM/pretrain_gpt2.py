@@ -72,7 +72,7 @@ def get_topology(args) -> PipeModelDataParallelTopology:
 
 
 def pipeline_enabled(args) -> bool:
-    return get_topology(args).get_dim('pipe') > 1
+    return get_topology(args).get_dim('pipe') > 1 or args.force_pp
 
 
 def get_loss(output, label_info):
