@@ -6,9 +6,9 @@
 # DP = 8, VMP = 1
 # Change for multinode config
 MP_SIZE=${MP_SIZE:-8}
-
-NUM_WORKERS=1
-NUM_GPUS_PER_WORKER=8
+PP_SIZE=${PP_SIZE:-1}
+NUM_GPUS_PER_WORKER=${NUM_GPUS_PER_WORKER:-8}
+NUM_WORKERS=${NUM_WORKERS:-1}
 
 script_path=$(realpath $0)
 script_dir=$(dirname $script_path)
@@ -16,10 +16,11 @@ script_dir=$(dirname $script_path)
 config_json="$script_dir/ds_zero2_pretrain_gpt2XL_model_parallel_config.json"
 gpt_options=" \
        --model-parallel-size ${MP_SIZE} \
+       --num-stages ${PP_SIZE} \
+       --batch-size 16 \
        --num-layers 48 \
        --hidden-size 1536 \
        --num-attention-heads 24 \
-       --batch-size 8 \
        --seq-length 1024 \
        --max-position-embeddings 1024 \
        --train-iters 20 \

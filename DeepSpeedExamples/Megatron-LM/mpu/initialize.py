@@ -81,19 +81,21 @@ def get_data_parallel_world_size():
     return _PIPELINE_PARALLEL_GRID.get_data_parallel_world_size()
 
 
+# Note (AC): "slice" dimension in Deepspeed pipe module means model dimension in Megatron-LM
+#            On the other hand, model dimension in Deepspeed pipe module is actually model dimension times pipeline dimension.
 @ensure_initialized
 def get_model_parallel_rank():
-    return _PIPELINE_PARALLEL_GRID.get_model_parallel_rank()
+    return _PIPELINE_PARALLEL_GRID.get_slice_parallel_rank()
 
 
 @ensure_initialized
 def get_model_parallel_group():
-    return _PIPELINE_PARALLEL_GRID.get_model_parallel_group()
+    return _PIPELINE_PARALLEL_GRID.get_slice_parallel_group()
 
 
 @ensure_initialized
 def get_model_parallel_world_size():
-    return _PIPELINE_PARALLEL_GRID.get_model_parallel_world_size()
+    return _PIPELINE_PARALLEL_GRID.get_slice_parallel_world_size()
 
 
 @ensure_initialized
@@ -104,6 +106,11 @@ def get_model_parallel_src_rank():
     local_world_size = get_model_parallel_world_size()
     return (global_rank // local_world_size) * local_world_size
 
+@ensure_initialized
+def get_data_parallel_src_rank():
+    global_rank = dist.get_rank()
+    local_world_size = get_model_parallel_world_size() * get_data_parallel_world_size()
+    return (global_rank // local_world_size) * local_world_size + get_model_parallel_rank()
 
 def destroy_model_parallel():
     """Set the groups to none."""

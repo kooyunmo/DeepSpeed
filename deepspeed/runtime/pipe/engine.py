@@ -49,9 +49,19 @@ class PipelineEngine(DeepSpeedEngine):
     This engine is created by ``deepspeed.initialize()`` when a :class:`PipelineModule`
     is provided.
     """
+
+    @property
+    def pipeline_module(self) -> PipelineModule:
+        module = self.module
+        # Unwrap decorator classes
+        while hasattr(module, 'module') and not isinstance(module, PipelineModule):
+            module = module.module
+        assert isinstance(module, PipelineModule), "model must base PipelineModule"
+        return module
+
     def __init__(self, *super_args, **super_kwargs):
         super().__init__(*super_args, **super_kwargs)
-        assert isinstance(self.module, PipelineModule), "model must base PipelineModule"
+        assert isinstance(self.pipeline_module, PipelineModule), "model must base PipelineModule"
 
         # We schedule the all-reduces, so disable it in super().backward()
         self.enable_backward_allreduce = False
@@ -63,7 +73,7 @@ class PipelineEngine(DeepSpeedEngine):
         self.micro_batches = self.gradient_accumulation_steps()
 
         # Set Grid and Communication Groups
-        self.grid = self.module._grid
+        self.grid = self.pipeline_module._grid
         if self.grid.get_global_rank() == 0:
             logger.info(f'CONFIG: micro_batches={self.micro_batches} '
                         f'micro_batch_size={self.micro_batch_size}')
@@ -105,13 +115,13 @@ class PipelineEngine(DeepSpeedEngine):
         self.is_pipe_partitioned = self.is_model_parallel
         self.is_grad_partitioned = False
 
-        model_parameters = filter(lambda p: p.requires_grad, self.module.parameters())
+        model_parameters = filter(lambda p: p.requires_grad, self.pipeline_module.parameters())
         num_params = sum([p.numel() for p in model_parameters])
         unique_params = num_params
         # Subtract tied parameters if we don't own them
-        if self.module.tied_comms:
+        if self.pipeline_module.tied_comms:
             tied_params = 0
-            for key, d in self.module.tied_comms.items():
+            for key, d in self.pipeline_module.tied_comms.items():
                 if self.global_rank != min(d['ranks']):
                     tied_params += sum(p.numel() for p in d['module'].parameters())
             unique_params -= tied_params
@@ -124,8 +134,8 @@ class PipelineEngine(DeepSpeedEngine):
         if self.grid.data_parallel_id == 0:
             logger.info(f'RANK={self.global_rank} '
                         f'STAGE={self.stage_id} '
-                        f'LAYERS={self.module._local_stop - self.module._local_start} '
-                        f'[{self.module._local_start}, {self.module._local_stop}) '
+                        f'LAYERS={self.pipeline_module._local_stop - self.pipeline_module._local_start} '
+                        f'[{self.pipeline_module._local_start}, {self.pipeline_module._local_stop}) '
                         f'STAGE_PARAMS={num_params} ({num_params/1e6:0.3f}M) '
                         f'TOTAL_PARAMS={total_params} ({total_params/1e6:0.3f}M) '
                         f'UNIQUE_PARAMS={unique_params} ({unique_params/1e6:0.3f}M)')
@@ -159,11 +169,11 @@ class PipelineEngine(DeepSpeedEngine):
         self.dp_group_loss = torch.tensor(0.0, requires_grad=False).to(self.device)
 
         if self._config.pipeline['activation_checkpoint_interval'] > 0:
-            self.module.activation_checkpoint_interval = self._config.pipeline[
+            self.pipeline_module.activation_checkpoint_interval = self._config.pipeline[
                 'activation_checkpoint_interval']
 
         if self.is_last_stage():
-            self.loss_model = self.module.loss_fn
+            self.loss_model = self.pipeline_module.loss_fn
 
         # Initialize pipeline communicators. Just send a 0.
         if is_even(self.stage_id):
@@ -205,7 +215,7 @@ class PipelineEngine(DeepSpeedEngine):
         self.set_dataloader(pipe_dataloader)
 
     def _exec_reduce_tied_grads(self):
-        self.module.allreduce_tied_weight_gradients()
+        self.pipeline_module.allreduce_tied_weight_gradients()
 
     def _exec_reduce_grads(self):
         self._force_grad_boundary = True
@@ -491,6 +501,7 @@ class PipelineEngine(DeepSpeedEngine):
             inputs = self.pipe_buffers['inputs'][buffer_id].clone()
 
         # collect the partitioned input from the previous stage
+        '''
         if self.is_pipe_partitioned and not self.is_first_stage():
             part_input = PartitionedTensor.from_meta(
                 meta=inputs[0],
@@ -503,7 +514,9 @@ class PipelineEngine(DeepSpeedEngine):
             #inputs[1].requires_grad = True
             part_input = None
             self.pipe_buffers['inputs'][buffer_id] = inputs
-
+        # Commented out by AC
+        '''
+        
         # Zero out the gradients each time we use the tensor because only the data in
         # tensor changes across batches
         self._zero_grads(inputs)
@@ -511,6 +524,7 @@ class PipelineEngine(DeepSpeedEngine):
         outputs = super().forward(inputs)
 
         # Partition the outputs if we are not the last stage
+        """
         if self.is_pipe_partitioned and not self.is_last_stage():
             part = PartitionedTensor(tensor=outputs[0],
                                      group=self.grid.get_slice_parallel_group())
@@ -520,6 +534,9 @@ class PipelineEngine(DeepSpeedEngine):
             # Inject the partitioned tensor into the output before sending
             outputs = tuple([part.to_meta(), part.data(), outputs[1]])
             part = None
+
+        # Commented out by AC
+        """
 
         self.pipe_buffers['outputs'][buffer_id] = outputs
 
@@ -557,6 +574,13 @@ class PipelineEngine(DeepSpeedEngine):
 
         outputs = self.pipe_buffers['outputs'][buffer_id]
 
+        # XXX Added by Alchan
+        if self.pipeline_module.__class__.__name__ == 'GPT2ModelPipe':
+            outputs = list(outputs)
+            outputs.pop()
+            outputs = tuple(outputs)
+
+
         if self.wall_clock_breakdown():
             self.timers('backward_microstep').start()
             self.timers('backward').start()
@@ -565,6 +589,7 @@ class PipelineEngine(DeepSpeedEngine):
 
         # Reconstruct if we previously partitioned the output. We must be
         # careful to also restore the computational graph of the tensors we partitioned.
+        """
         if self.is_pipe_partitioned:
             if self.is_grad_partitioned:
                 part_output = PartitionedTensor.from_meta(
@@ -581,8 +606,9 @@ class PipelineEngine(DeepSpeedEngine):
                 outputs = tuple(
                     [self.pipe_buffers['output_tensors'][buffer_id],
                      outputs[1]])
-
+        """
         grad_tensors = self.grad_layer
+        '''
         if self.is_grad_partitioned:
             #print(f'RANK={self.global_rank} BEFORE-BWD restoring grad={self.grad_layer[0].size()} {self.grad_layer[1].size()}')
             part_grad = PartitionedTensor.from_meta(
@@ -592,7 +618,7 @@ class PipelineEngine(DeepSpeedEngine):
             grad_tensors = tuple([part_grad.full(), self.grad_layer[2]])
             part_grad = None
             #print(f'RANK={self.global_rank} BEFORE-BWD restored grad={self.grad_layer[0].size()} {self.grad_layer[1].size()}')
-
+        '''
         # This handles either a single tensor or tuple of tensors.
         if isinstance(outputs, tuple):
             out_tensors = [t for t in outputs if t.is_floating_point()]
@@ -777,10 +803,12 @@ class PipelineEngine(DeepSpeedEngine):
         # NCCL does not like to send torch.BoolTensor types, so cast the mask to half().
         # We could do char, but with half() we can eventually flatten with other fp16
         # messages (TODO)
-        if self.module.__class__.__name__ == 'GPT2ModelPipe':
+        '''
+        if self.pipeline_module.__class__.__name__ == 'GPT2ModelPipe':
             outputs = list(outputs)
             outputs[-1] = outputs[-1].half()
             outputs = tuple(outputs)
+        '''
 
         if self.first_output_send:
             self.first_output_send = False
@@ -796,10 +824,12 @@ class PipelineEngine(DeepSpeedEngine):
                                       f'{type(outputs)}')
 
         # Restore the boolean tensor
-        if self.module.__class__.__name__ == 'GPT2ModelPipe':
+        '''
+        if self.pipeline_module.__class__.__name__ == 'GPT2ModelPipe':
             outputs = list(outputs)
             outputs[-1] = outputs[-1].bool()
             outputs = tuple(outputs)
+        '''
 
         if self.wall_clock_breakdown():
             self.timers('pipe_send_output').stop()
@@ -811,6 +841,7 @@ class PipelineEngine(DeepSpeedEngine):
         inputs = self.pipe_buffers['inputs'][buffer_id]
 
         # Partition the gradient
+        '''
         if self.is_grad_partitioned:
             part = PartitionedTensor(tensor=inputs[0].grad,
                                      group=self.grid.get_slice_parallel_group())
@@ -819,13 +850,15 @@ class PipelineEngine(DeepSpeedEngine):
 
             # XXX Hack
             inputs = tuple([part.to_meta(), part.data(), inputs[1]])
-
+        
+        # commented out by Alchan
+        '''
         # XXX Terrible hack
         # Drop the attention mask from the input buffer here. It does not have
         # a grad that needs to be communicated. We free the buffer immediately
         # after, so no need to restore it. The receiver also has a hack that skips
         # the recv. This is because NCCL does not let us send torch.BoolTensor :-(.
-        if self.module.__class__.__name__ == 'GPT2ModelPipe':
+        if self.pipeline_module.__class__.__name__ == 'GPT2ModelPipe':
             inputs = list(inputs)
             inputs.pop()
             inputs = tuple(inputs)
@@ -835,12 +868,14 @@ class PipelineEngine(DeepSpeedEngine):
             p2p.send(inputs.grad, self.prev_stage)
         else:
             # XXX terrible hacky branch
-            if self.is_grad_partitioned:
+            if False: # self.is_grad_partitioned:
+                '''
                 # First two sends are partitioned gradient
                 p2p.send(inputs[0], self.prev_stage)
                 p2p.send(inputs[1], self.prev_stage)
                 # XXX hack hack hack
                 #p2p.send(inputs[2].grad, self.prev_stage)
+                '''
             else:
                 for idx, buffer in enumerate(inputs):
                     # Skip tensors that will not produce a grad
@@ -859,9 +894,10 @@ class PipelineEngine(DeepSpeedEngine):
     def _exec_recv_activations(self, buffer_id):
         if self.wall_clock_breakdown():
             self.timers('pipe_recv_input').start()
-
+        
         recvd = None
 
+        # if dist.get_rank() == 3: breakpoint()
         # Allocate the buffer if necessary
         if self.pipe_recv_buf is None:
             self.pipe_recv_buf = self._recv_tensor_meta(self.prev_stage)
@@ -875,6 +911,7 @@ class PipelineEngine(DeepSpeedEngine):
             recvd = [None] * len(self.pipe_recv_buf)
             for idx, buffer in enumerate(self.pipe_recv_buf):
                 assert torch.is_tensor(buffer)
+                '''
                 # XXX hardcode meta type
                 if self.is_pipe_partitioned and idx == 0 and buffer.dtype != torch.long:
                     if self.meta_buffer is None:
@@ -882,14 +919,16 @@ class PipelineEngine(DeepSpeedEngine):
                                                        dtype=torch.long,
                                                        device=self.device)
                     buffer = self.meta_buffer
-
+                '''
                 p2p.recv(buffer, self.prev_stage)
                 recvd[idx] = buffer.clone().detach()
 
             # NCCL does not like to send torch.BoolTensor types, so un-cast the
             # attention mask
-            if self.module.__class__.__name__ == 'GPT2ModelPipe':
+            '''
+            if self.pipeline_module.__class__.__name__ == 'GPT2ModelPipe':
                 recvd[-1] = recvd[-1].bool()
+            '''
 
             recvd = tuple(recvd)
 
@@ -908,6 +947,7 @@ class PipelineEngine(DeepSpeedEngine):
         outputs = self.pipe_buffers['outputs'][buffer_id]
         # XXX these shapes are hardcoded for Megatron
         # Restore partitioned output if it was partitioned and we are sending full gradients
+        '''
         if self.is_pipe_partitioned and not self.is_grad_partitioned:
             part_output = PartitionedTensor.from_meta(
                 meta=outputs[0],
@@ -917,6 +957,13 @@ class PipelineEngine(DeepSpeedEngine):
             outputs = tuple([outputs[0], outputs[2]])
             # save for backward
             self.pipe_buffers['outputs'][buffer_id] = outputs
+        '''
+
+        # XXX Added by Alchan
+        if self.pipeline_module.__class__.__name__ == 'GPT2ModelPipe':
+            outputs = list(outputs)
+            outputs.pop()
+            outputs = tuple(outputs)
 
         # Allocate gradient if necessary
         if self.grad_layer is None:
@@ -932,11 +979,13 @@ class PipelineEngine(DeepSpeedEngine):
         else:
             assert isinstance(outputs, tuple)
             for idx, buffer in enumerate(self.grad_layer):
+                '''
                 # XXX GPT-2 hack
                 if self.is_grad_partitioned and idx == 0 and buffer.dtype != torch.long:
                     buffer.data = torch.zeros(buffer.size(),
                                               dtype=torch.long,
                                               device=self.device)
+                '''
                 p2p.recv(buffer, self.next_stage)
 
         if self.wall_clock_breakdown():
@@ -1107,11 +1156,11 @@ class PipelineEngine(DeepSpeedEngine):
         Returns:
             None
         """
-        assert isinstance(self.module, PipelineModule)
+        assert isinstance(self.pipeline_module, PipelineModule)
         assert self._curr_ckpt_path is not None, \
             "PipelineEngine expects module_state_dict() to be called from save_checkpoint()"
 
-        self.module.save_state_dict(self._curr_ckpt_path)
+        self.pipeline_module.save_state_dict(self._curr_ckpt_path)
         return None
 
     def load_module_state_dict(self, state_dict, strict=True):
@@ -1129,7 +1178,7 @@ class PipelineEngine(DeepSpeedEngine):
             super().load_module_state_dict(state_dict, strict)
             return
 
-        self.module.load_state_dir(load_dir=self._curr_ckpt_path, strict=strict)
+        self.pipeline_module.load_state_dir(load_dir=self._curr_ckpt_path, strict=strict)
 
     # A map of PipeInstruction types to methods. Each method will be executed with the
     # kwargs provided to the PipeInstruction from the scheduler.
@@ -1147,6 +1196,9 @@ class PipelineEngine(DeepSpeedEngine):
     }
 
     def _exec_schedule(self, pipe_schedule):
+        # HACK: WTF by Alchan
+        import os
+        os.environ['HACK_LAST_STAGE'] = str(self.is_last_stage())
         self._reserve_pipe_buffers(pipe_schedule.num_pipe_buffers())
         # For each step in the schedule
         for step_cmds in pipe_schedule:

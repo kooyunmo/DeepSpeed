@@ -82,6 +82,8 @@ def get_loss(output, label_info):
     loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
     return loss
 
+class GPT2ModelPipe(PipelineModule):
+    '''SUPER HACK: See ``deepspeed.runtime.pipe.engine#L790``'''
 
 def get_model(args):
     """Build the model."""
@@ -100,8 +102,8 @@ def get_model(args):
                         parallel_output=True)
     if pipeline_enabled(args):
         layer_specs = GPT2Model.layer_specs(**model_kwargs)
-        model = PipelineModule(layers=layer_specs, topology=get_topology(args),
-                               loss_fn=get_loss, partition_method='parameters', num_stages=args.num_stages)
+        model = GPT2ModelPipe(layers=layer_specs, topology=get_topology(args),
+                              loss_fn=get_loss, partition_method='parameters', num_stages=args.num_stages)
     else:
         model = GPT2Model(**model_kwargs)
 
@@ -200,13 +202,12 @@ def setup_model_and_optimizer(args):
 
     if args.deepspeed:
         print_rank_0("DeepSpeed is enabled.")
-
         model, optimizer, _, lr_scheduler = deepspeed.initialize(
             model=model,
             model_parameters=param_groups,
             args=args,
             lr_scheduler=lr_scheduler,
-            mpu=mpu,
+            mpu=mpu if not pipeline_enabled(args) else None,
             dist_init_required=False
         )
 
@@ -438,8 +439,20 @@ def train_step_pipe(data_iterator, model: PipelineEngine, optimizer, lr_schedule
         except StopIteration:
             pass
     wrapped_iter = iter_wrapper(data_iterator)
-    ln_loss_reduced =  model.train_batch(wrapped_iter)
-    return ln_loss_reduced, 0
+
+    @model.set_batch_fn
+    def batch_mp_non_zero(batch):
+        if batch is None:
+            result = next(wrapped_iter)  # HACK: See ``deepspeed.runtime.pipe.engine#L477``
+        else:
+            result = batch
+        if result is None:
+            raise RuntimeError(f"[rank {dist.is_initialized() and dist.get_rank()}] Why? batch is None!!")
+        return result
+
+    lm_loss_reduced = model.train_batch(wrapped_iter)
+
+    return lm_loss_reduced, 0
 
 
 def train(model, optimizer, lr_scheduler,
@@ -734,6 +747,7 @@ def main():
 
         # Model, optimizer, and learning rate.
         model, optimizer, lr_scheduler = setup_model_and_optimizer(args)
+
 
         # Resume data loader if necessary.
         if args.resume_dataloader:

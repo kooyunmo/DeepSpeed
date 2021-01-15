@@ -318,9 +318,9 @@ def scaled_init_method(sigma, num_layers):
 
 
 class ChkptGPT2ParallelTransformerLayer(GPT2ParallelTransformerLayer):
-    def __init__(self, checkpoint_activations=True, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
+        self.checkpoint_activations = kwargs.pop('checkpoint_activations', True)
         super().__init__(*args, **kwargs)
-        self.checkpoint_activations = checkpoint_activations
 
     def forward(self, hidden_states, attention_mask) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.checkpoint_activations:
@@ -395,7 +395,7 @@ class GPT2ParallelTransformer(torch.nn.Module):
                 )
                 for _ in range(num_layers)
             ],
-            LayerSpec(DummyMaskLayerNorm, eps=layernorm_epsilon),
+            LayerSpec(DummyMaskLayerNorm, hidden_size, eps=layernorm_epsilon),
         ]
 
     def __init__(self,

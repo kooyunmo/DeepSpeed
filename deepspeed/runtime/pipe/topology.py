@@ -442,6 +442,8 @@ class PipelineParallelGrid:
         return self.ds_model_proc_group
 
     # For Megatron-style tensor slicing
+    # Note (AC): "slice" dimension here means model dimension in Megatron-LM
+    #            On the other hand, model dimension is actually model dimension times pipeline dimension.
     def get_slice_parallel_rank(self):
         if 'model' in self._topo.get_axis_names():
             return self._topo.get_coord(rank=self.global_rank).model
@@ -449,7 +451,7 @@ class PipelineParallelGrid:
             return 0
 
     def get_slice_parallel_world_size(self):
-        self.slice_parallel_size
+        return self.slice_proc_group.size()
 
     def get_slice_parallel_group(self):
         return self.slice_proc_group

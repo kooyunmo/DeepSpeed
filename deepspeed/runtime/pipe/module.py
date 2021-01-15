@@ -303,8 +303,6 @@ class PipelineModule(nn.Module):
 
             def exec_func(*inputs):
                 # Single tensor inputs need to be unwrapped
-                if len(inputs) == 1:
-                    inputs = inputs[0]
                 for idx, layer in enumerate(self.forward_funcs[start:end]):
                     self.curr_layer = idx + self._local_start
                     if self.seed_layers:
@@ -315,14 +313,19 @@ class PipelineModule(nn.Module):
                         else:
                             ds_utils.set_random_seed(new_seed)
 
-                    inputs = layer(inputs)
+                    if not isinstance(inputs, (list, tuple)):
+                        inputs = (inputs, )
+                    inputs = layer(*inputs)
                 return inputs
 
             return exec_func
 
         if self.activation_checkpoint_interval == 0:
             func = exec_range_func(0, len(self.forward_funcs))
-            x = func(forward_input)
+            if isinstance(forward_input, (tuple, list)):
+                x = func(*forward_input)
+            else:
+                x = func(forward_input)
         else:
             num_layers = len(self.forward_funcs)
             x = forward_input
