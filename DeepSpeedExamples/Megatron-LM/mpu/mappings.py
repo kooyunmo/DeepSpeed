@@ -99,6 +99,7 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_):
+        event_manager.init_current_thread("backward_thread") # called in backward thread when recompute a checkpoint segment
         with event_manager.timespan("reduce_from_model_parallel_region"):
             return _reduce(input_)
 
