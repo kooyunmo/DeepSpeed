@@ -62,7 +62,14 @@ class FP16_Module(nn.Module):
         self.add_module('module', module.half())
 
     def forward(self, *inputs, **kwargs):
-        return fp16_to_fp32(self.module(*(fp32_to_fp16(inputs)), **kwargs))
+        outputs = self.module(*fp32_to_fp16(inputs), **kwargs)
+
+        import os
+        # HACK WTF by Alchan
+        if os.environ.get('HACK_LAST_STAGE', 'True') == 'True':
+            return fp16_to_fp32(outputs)
+        else:
+            return outputs
 
     def state_dict(self, destination=None, prefix='', keep_vars=False):
         return self.module.state_dict(destination, prefix, keep_vars)

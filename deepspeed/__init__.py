@@ -46,6 +46,16 @@ sys.modules['deepspeed.pt.deepspeed_config'] = deepspeed.runtime.config
 setattr(deepspeed.pt, 'loss_scaler', deepspeed.runtime.fp16.loss_scaler)
 sys.modules['deepspeed.pt.loss_scaler'] = deepspeed.runtime.fp16.loss_scaler
 
+def _unwrap(model):
+    unwrapped_model = model
+    while hasattr(unwrapped_model, 'module') and not isinstance(unwrapped_model, PipelineModule):
+        unwrapped_model = unwrapped_model.module
+    return unwrapped_model
+
+def _is_pipeline_model(model):
+    unwrapped_model = _unwrap(model)
+    return isinstance(unwrapped_model, PipelineModule)
+
 
 def initialize(args,
                model,
@@ -106,7 +116,8 @@ def initialize(args,
         __git_branch__),
              ranks=[0])
 
-    if not isinstance(model, PipelineModule):
+
+    if not _is_pipeline_model(model):
         engine = DeepSpeedEngine(args=args,
                                  model=model,
                                  optimizer=optimizer,
@@ -118,15 +129,14 @@ def initialize(args,
                                  collate_fn=collate_fn,
                                  config_params=config_params)
     else:
-        # We do need an external MPU for our Megatron-LM example. (commented out by AC)
-        # assert mpu is None, "mpu must be None with pipeline parallelism"
+        assert mpu is None, "mpu must be None with pipeline parallelism"
         engine = PipelineEngine(args=args,
                                 model=model,
                                 optimizer=optimizer,
                                 model_parameters=model_parameters,
                                 training_data=training_data,
                                 lr_scheduler=lr_scheduler,
-                                mpu=mpu or model.mpu(),
+                                mpu=_unwrap(model).mpu(),
                                 dist_init_required=dist_init_required,
                                 collate_fn=collate_fn,
                                 config_params=config_params)

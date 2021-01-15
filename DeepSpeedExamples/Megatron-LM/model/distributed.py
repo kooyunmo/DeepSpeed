@@ -29,7 +29,7 @@ class DistributedDataParallel(Module):
 
         self.module = module
         self.data_parallel_group = mpu.get_data_parallel_group()
-        src_rank = mpu.get_model_parallel_rank()
+        src_rank = mpu.get_data_parallel_src_rank()
         for p in self.module.parameters():
             if torch.is_tensor(p):
                 dist.broadcast(p, src_rank, group=self.data_parallel_group)
