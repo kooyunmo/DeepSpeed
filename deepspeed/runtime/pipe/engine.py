@@ -569,6 +569,8 @@ class PipelineEngine(DeepSpeedEngine):
                                            "init in order to use backward"
 
         outputs = self.pipe_buffers['outputs'][buffer_id]
+        if not isinstance(outputs, (tuple, list)):
+            outputs = (outputs, )
         with event_manager.timespan("backward_pass",
                                     data={"buffer_id": buffer_id, "dtypes": [str(out.dtype) for out in outputs],
                                           "sizes": [list(out.size()) for out in outputs]}):
