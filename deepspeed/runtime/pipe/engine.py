@@ -1215,14 +1215,13 @@ class PipelineEngine(DeepSpeedEngine):
         os.environ['HACK_LAST_STAGE'] = str(self.is_last_stage())
         self._reserve_pipe_buffers(pipe_schedule.num_pipe_buffers())
         # For each step in the schedule
-        for step_cmds in pipe_schedule:
-            # For each instruction in the step
-            for cmd in step_cmds:
-                if type(cmd) not in self._INSTRUCTION_MAP:
-                    raise RuntimeError(
-                        f'{self.__class__.__name__} does not understand instruction {repr(cmd)}'
-                    )
+        all_cmds = [cmd for step_cmds in pipe_schedule for cmd in step_cmds]
+        for cmd in all_cmds:
+            if type(cmd) not in self._INSTRUCTION_MAP:
+                raise RuntimeError(
+                    f'{self.__class__.__name__} does not understand instruction {repr(cmd)}'
+                )
 
-                # Equivalent to: self._exec_forward_pass(buffer_id=0)
-                self._exec_instr = MethodType(self._INSTRUCTION_MAP[type(cmd)], self)
-                self._exec_instr(**cmd.kwargs)
+            # Equivalent to: self._exec_forward_pass(buffer_id=0)
+            self._exec_instr = MethodType(self._INSTRUCTION_MAP[type(cmd)], self)
+            self._exec_instr(**cmd.kwargs)
