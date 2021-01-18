@@ -74,6 +74,9 @@ def get_topology(args) -> PipeModelDataParallelTopology:
 def pipeline_enabled(args) -> bool:
     return get_topology(args).get_dim('pipe') > 1 or args.force_pp
 
+def setup_pipeline(args):
+    if pipeline_enabled(args):
+        os.environ['OVERLAP_PP'] = str(bool(args.overlap_pp))
 
 def get_loss(output, label_info):
     labels, loss_mask = label_info  # See the signature in train_step_pipe
@@ -734,6 +737,8 @@ def main():
     @event_manager.add_pre_handler
     def event_handler(event):
         torch.cuda.current_stream().synchronize()
+    
+    setup_pipeline(args)
 
     recorder = ChromeTraceRecorder(event_manager)
     recorder.enable()
