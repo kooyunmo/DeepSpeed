@@ -7,7 +7,10 @@ import os
 
 from types import MethodType
 
+from queue import Queue
+from threading import Thread
 from numpy import prod
+from contextlib import ExitStack
 
 import torch
 import torch.nn as nn
@@ -202,6 +205,43 @@ class PipelineEngine(DeepSpeedEngine):
             self.timers('backward_allreduce').stop()
             self.timers('step_microstep').start()
             self.timers('step_microstep').stop()
+
+        self.send_activation_queue, self.recv_activation_queue = Queue(maxsize=1), Queue(maxsize=1)
+        self.send_grad_queue, self.recv_grad_queue = Queue(maxsize=1), Queue(maxsize=1)
+        self.grad_receiver_in_queue = Queue()
+        self.overlap = os.environ.get('OVERLAP_PP', 'False') == 'True'
+
+        self._p2p_ring_test(is_grad=False)
+        self._p2p_ring_test(is_grad=True)
+
+    def _p2p_ring_test(self, is_grad):
+        def wraparound(x):
+            return (x + self.num_stages) % self.num_stages
+
+        if self.num_stages <= 1:
+            return
+
+        tensor_sent = torch.tensor(self.stage_id, device=self.device, dtype=torch.int32)
+        tensor_recv = torch.tensor(-1, device=self.device, dtype=torch.int32)
+        prev, next = wraparound(self.prev_stage), wraparound(self.next_stage)
+        if is_grad:
+            if self.is_first_stage():
+                p2p.send(tensor_sent, prev, is_grad=is_grad)
+                p2p.recv(tensor_recv, next, is_grad=is_grad)
+            else:
+                p2p.recv(tensor_recv, next, is_grad=is_grad)
+                p2p.send(tensor_sent, prev, is_grad=is_grad)
+            torch.cuda.current_stream().synchronize()
+            assert tensor_recv.item() == next
+        else:
+            if self.is_first_stage():
+                p2p.send(tensor_sent, next, is_grad=is_grad)
+                p2p.recv(tensor_recv, prev, is_grad=is_grad)
+            else:
+                p2p.recv(tensor_recv, prev, is_grad=is_grad)
+                p2p.send(tensor_sent, next, is_grad=is_grad)
+            torch.cuda.current_stream().synchronize()
+            assert tensor_recv.item() == prev
 
     def _build_data_iter(self, dataset):
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -497,6 +537,9 @@ class PipelineEngine(DeepSpeedEngine):
         self.tput_timer.start()
         self.mem_status('BEFORE FWD', reset_max=True)
 
+        if self.overlap and not self.is_first_stage():
+            self.recv_activation_queue.get()  # Wait until activation received
+
         if isinstance(self.pipe_buffers['inputs'][buffer_id], tuple):
             inputs = tuple(t.clone() for t in self.pipe_buffers['inputs'][buffer_id])
         else:
@@ -525,7 +568,6 @@ class PipelineEngine(DeepSpeedEngine):
             # Zero out the gradients each time we use the tensor because only the data in
             # tensor changes across batches
             self._zero_grads(inputs)
-
             outputs = super().forward(inputs)
 
             # Partition the outputs if we are not the last stage
@@ -564,9 +606,16 @@ class PipelineEngine(DeepSpeedEngine):
                     for idx, l in enumerate(self.loss):
                         self.total_loss[idx] += l.detach()
 
+        if self.overlap and not self.is_last_stage():
+            self.send_activation_queue.put(True)  # Trigger a thread to send activation
+            self.grad_receiver_in_queue.put(True)
+
     def _exec_backward_pass(self, buffer_id):
         assert self.optimizer is not None, "must provide optimizer during " \
                                            "init in order to use backward"
+
+        if self.overlap and not self.is_last_stage():
+            self.recv_grad_queue.get()  # Wait until grad received
 
         outputs = self.pipe_buffers['outputs'][buffer_id]
         if not isinstance(outputs, (tuple, list)):
@@ -579,77 +628,44 @@ class PipelineEngine(DeepSpeedEngine):
             # The last stage just runs backward on the loss using DeepSpeed's typical
             # mechanisms.
             if self.is_last_stage():
-                    super().backward(self.loss)
-                    self.mem_status('AFTER BWD')
-                    return
+                super().backward(self.loss)
+            else:
+                # XXX Added by Alchan
+                if self.pipeline_module.__class__.__name__ == 'GPT2ModelPipe':
+                    outputs = list(outputs)
+                    outputs.pop()
+                    outputs = tuple(outputs)
 
+                if self.wall_clock_breakdown():
+                    self.timers('backward_microstep').start()
+                    self.timers('backward').start()
+                    self.timers('backward_inner_microstep').start()
+                    self.timers('backward_inner').start()
 
-            # XXX Added by Alchan
-            if self.pipeline_module.__class__.__name__ == 'GPT2ModelPipe':
-                outputs = list(outputs)
-                outputs.pop()
-                outputs = tuple(outputs)
+                grad_tensors = self.grad_layer
+                with event_manager.timespan("backward"):
+                    if isinstance(outputs, tuple):
+                        out_tensors = [t for t in outputs if t.is_floating_point()]
+                        assert len(out_tensors) == len(grad_tensors)
+                        torch.autograd.backward(tensors=out_tensors, grad_tensors=grad_tensors)
+                    else:
+                        torch.autograd.backward(tensors=(outputs, ), grad_tensors=(grad_tensors, ))
 
+                # Free up the memory from the output of forward()
+                self.pipe_buffers['output_tensors'][buffer_id] = None
+                self.pipe_buffers['outputs'][buffer_id] = None
+                grad_tensors = None
 
-            if self.wall_clock_breakdown():
-                self.timers('backward_microstep').start()
-                self.timers('backward').start()
-                self.timers('backward_inner_microstep').start()
-                self.timers('backward_inner').start()
-
-            # Reconstruct if we previously partitioned the output. We must be
-            # careful to also restore the computational graph of the tensors we partitioned.
-            """
-            if self.is_pipe_partitioned:
-                if self.is_grad_partitioned:
-                    part_output = PartitionedTensor.from_meta(
-                        meta=outputs[0],
-                        local_part=outputs[1],
-                        group=self.grid.get_slice_parallel_group())
-                    self.pipe_buffers['output_tensors'][buffer_id].data = part_output.full()
-                    outputs = tuple(
-                        [self.pipe_buffers['output_tensors'][buffer_id],
-                        outputs[2]])
-                else:
-                    # Already restored from partition
-                    self.pipe_buffers['output_tensors'][buffer_id].data = outputs[0]
-                    outputs = tuple(
-                        [self.pipe_buffers['output_tensors'][buffer_id],
-                        outputs[1]])
-            """
-            grad_tensors = self.grad_layer
-            '''
-            if self.is_grad_partitioned:
-                #print(f'RANK={self.global_rank} BEFORE-BWD restoring grad={self.grad_layer[0].size()} {self.grad_layer[1].size()}')
-                part_grad = PartitionedTensor.from_meta(
-                    meta=self.grad_layer[0],
-                    local_part=self.grad_layer[1],
-                    group=self.grid.get_slice_parallel_group())
-                grad_tensors = tuple([part_grad.full(), self.grad_layer[2]])
-                part_grad = None
-                #print(f'RANK={self.global_rank} BEFORE-BWD restored grad={self.grad_layer[0].size()} {self.grad_layer[1].size()}')
-            '''
-            # This handles either a single tensor or tuple of tensors.
-            with event_manager.timespan("backward"):
-                if isinstance(outputs, tuple):
-                    out_tensors = [t for t in outputs if t.is_floating_point()]
-                    assert len(out_tensors) == len(grad_tensors)
-                    torch.autograd.backward(tensors=out_tensors, grad_tensors=grad_tensors)
-                else:
-                    torch.autograd.backward(tensors=(outputs, ), grad_tensors=(grad_tensors, ))
-
-            # Free up the memory from the output of forward()
-            self.pipe_buffers['output_tensors'][buffer_id] = None
-            self.pipe_buffers['outputs'][buffer_id] = None
-            grad_tensors = None
-
-            if self.wall_clock_breakdown():
-                self.timers('backward_inner').stop()
-                self.timers('backward_inner_microstep').stop()
-                self.timers('backward').stop()
-                self.timers('backward_microstep').stop()
+                if self.wall_clock_breakdown():
+                    self.timers('backward_inner').stop()
+                    self.timers('backward_inner_microstep').stop()
+                    self.timers('backward').stop()
+                    self.timers('backward_microstep').stop()
 
             self.mem_status('AFTER BWD')
+
+        if self.overlap and not self.is_first_stage():
+            self.send_grad_queue.put(True)  # trigger a thread to send grad
 
     def _exec_load_micro_batch(self, buffer_id):
         with event_manager.timespan("load_micro_batches", data={"buffer_id": buffer_id}):
@@ -692,6 +708,7 @@ class PipelineEngine(DeepSpeedEngine):
 
             if self.wall_clock_breakdown():
                 self.timers('batch_input').stop()
+
 
     def _send_tensor_meta(self, buffer, recv_stage):
         """ Communicate metadata about upcoming p2p transfers.
@@ -810,6 +827,9 @@ class PipelineEngine(DeepSpeedEngine):
         if self.wall_clock_breakdown():
             self.timers('pipe_send_output').start()
 
+        if self.overlap:
+            self.send_activation_queue.get()
+
         outputs = self.pipe_buffers['outputs'][buffer_id]
         with event_manager.timespan("send_activations", data={"buffer_id": buffer_id, "dtypes": [str(out.dtype) for out in outputs],
                                                                    "sizes": [list(out.size()) for out in outputs]}):
@@ -826,12 +846,15 @@ class PipelineEngine(DeepSpeedEngine):
             if self.first_output_send:
                 self.first_output_send = False
                 self._send_tensor_meta(outputs, self.next_stage)
+                torch.cuda.current_stream().synchronize()
 
             if isinstance(outputs, torch.Tensor):
                 p2p.send(outputs, self.next_stage)
+                torch.cuda.current_stream().synchronize()
             elif isinstance(outputs, tuple):
                 for idx, buffer in enumerate(outputs):
                     p2p.send(buffer, self.next_stage)
+                    torch.cuda.current_stream().synchronize()
             else:
                 raise NotImplementedError('Could not send output of type '
                                         f'{type(outputs)}')
@@ -847,9 +870,14 @@ class PipelineEngine(DeepSpeedEngine):
             if self.wall_clock_breakdown():
                 self.timers('pipe_send_output').stop()
 
+
     def _exec_send_grads(self, buffer_id):
         if self.wall_clock_breakdown():
             self.timers('pipe_send_grad').start()
+        
+        if self.overlap:
+            self.send_grad_queue.get()
+
 
         inputs = self.pipe_buffers['inputs'][buffer_id]
         with event_manager.timespan("send_grads",
@@ -880,7 +908,8 @@ class PipelineEngine(DeepSpeedEngine):
 
             if isinstance(inputs, torch.Tensor):
                 assert inputs.grad is not None
-                p2p.send(inputs.grad, self.prev_stage)
+                p2p.send(inputs.grad, self.prev_stage, is_grad=True)
+                torch.cuda.current_stream().synchronize()
             else:
                 # XXX terrible hacky branch
                 if False: # self.is_grad_partitioned:
@@ -898,7 +927,8 @@ class PipelineEngine(DeepSpeedEngine):
                             assert buffer.grad is None
                             continue
                         assert buffer.grad is not None
-                        p2p.send(buffer.grad, self.prev_stage)
+                        p2p.send(buffer.grad, self.prev_stage, is_grad=True)
+                        torch.cuda.current_stream().synchronize()
 
             # We can free up the input buffer now
             self.pipe_buffers['inputs'][buffer_id] = None
@@ -919,6 +949,7 @@ class PipelineEngine(DeepSpeedEngine):
 
         if isinstance(self.pipe_recv_buf, torch.Tensor):
             p2p.recv(self.pipe_recv_buf, self.prev_stage)
+            torch.cuda.current_stream().synchronize()
             recvd = self.pipe_recv_buf.clone().detach()
             recvd.requires_grad = recvd.is_floating_point()
         else:
@@ -955,9 +986,15 @@ class PipelineEngine(DeepSpeedEngine):
         if self.wall_clock_breakdown():
             self.timers('pipe_recv_input').stop()
 
+        if self.overlap:
+            self.recv_activation_queue.put(True)
+
     def _exec_recv_grads(self, buffer_id):
         if self.wall_clock_breakdown():
             self.timers('pipe_recv_grad').start()
+
+        if self.overlap:
+           self.grad_receiver_in_queue.get()
 
         outputs = self.pipe_buffers['outputs'][buffer_id]
         # XXX these shapes are hardcoded for Megatron
@@ -990,7 +1027,7 @@ class PipelineEngine(DeepSpeedEngine):
                 self.grad_layer = self._allocate_buffers(sizes, num_buffers=1)[0]
 
         if isinstance(self.grad_layer, torch.Tensor):
-            p2p.recv(self.grad_layer, self.next_stage)
+            p2p.recv(self.grad_layer, self.next_stage, is_grad=True)
         else:
             assert isinstance(outputs, tuple)
             for idx, buffer in enumerate(self.grad_layer):
@@ -1001,10 +1038,13 @@ class PipelineEngine(DeepSpeedEngine):
                                               dtype=torch.long,
                                               device=self.device)
                 '''
-                p2p.recv(buffer, self.next_stage)
+                p2p.recv(buffer, self.next_stage, is_grad=True)
 
         if self.wall_clock_breakdown():
             self.timers('pipe_recv_grad').stop()
+
+        if self.overlap:
+            self.recv_grad_queue.put(True)
 
     def _exec_optimizer_step(self, lr_kwargs=None):
         with event_manager.timespan("optimizer_step"):
@@ -1218,6 +1258,19 @@ class PipelineEngine(DeepSpeedEngine):
         self._reserve_pipe_buffers(pipe_schedule.num_pipe_buffers())
         # For each step in the schedule
         all_cmds = [cmd for step_cmds in pipe_schedule for cmd in step_cmds]
+
+        if self.overlap:
+            device = torch.cuda.current_device()
+            comm_types = (schedule.SendActivation, schedule.RecvActivation, schedule.SendGrad, schedule.RecvGrad)
+            cmds = [cmd for cmd in all_cmds if isinstance(cmd, comm_types)]
+            all_cmds = [cmd for cmd in all_cmds if not isinstance(cmd, comm_types)]
+            threads = [Thread(target=self._work, args=(cmds, device), daemon=True)]
+        else:
+            threads = []
+
+        for thread in threads:
+            thread.start()
+
         for cmd in all_cmds:
             if type(cmd) not in self._INSTRUCTION_MAP:
                 raise RuntimeError(
@@ -1227,3 +1280,14 @@ class PipelineEngine(DeepSpeedEngine):
             # Equivalent to: self._exec_forward_pass(buffer_id=0)
             self._exec_instr = MethodType(self._INSTRUCTION_MAP[type(cmd)], self)
             self._exec_instr(**cmd.kwargs)
+
+        for thread in threads:
+            thread.join()
+
+    def _work(self, cmds, device):
+        event_manager.init_current_thread("comm_thread")
+        stream = torch.cuda.Stream(device=device)
+        with torch.cuda.stream(stream):
+            for cmd in cmds:
+                _exec_instr = MethodType(self._INSTRUCTION_MAP[type(cmd)], self)
+                _exec_instr(**cmd.kwargs)
