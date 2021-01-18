@@ -8,6 +8,7 @@
 MP_SIZE=${MP_SIZE:-8}
 SEQ_LENGTH=${SEQ_LENGTH:-2048}
 NUM_ATTENTION_HEADS=${NUM_ATTENTION_HEADS:-24}
+BATCH_SIZE=${BATCH_SIZE:-8}
 
 #export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
@@ -24,7 +25,7 @@ gpt_options=" \
        --hidden-size 1536 \
        --num-attention-heads ${NUM_ATTENTION_HEADS} \
        --num-sparse-attention-heads $((NUM_ATTENTION_HEADS/MP_SIZE)) \
-       --batch-size 32  \
+       --batch-size ${BATCH_SIZE} \
        --seq-length $SEQ_LENGTH \
        --max-position-embeddings $SEQ_LENGTH \
        --train-iters 35 \
