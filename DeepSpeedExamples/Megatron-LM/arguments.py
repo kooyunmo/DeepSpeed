@@ -68,6 +68,7 @@ def add_model_config_args(parser):
                         default=False,
                         action='store_true',
                         help='Use DeepSpeed sparse self attention.')
+    group.add_argument("--num-sparse-attention-heads", type=int, default=24)
 
     return parser
 

@@ -115,7 +115,7 @@ class GPT2Model(torch.nn.Module):
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
 
-        self.sparse_attention_config = get_sparse_attention_config(args, num_attention_heads) #TODO : set to None if use non-sparse
+        self.sparse_attention_config = get_sparse_attention_config(args, args.num_sparse_attention_heads) #TODO : set to None if use non-sparse
 
         # Transformer
         self.transformer = mpu.GPT2ParallelTransformer(self.sparse_attention_config,

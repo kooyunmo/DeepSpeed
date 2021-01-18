@@ -16,6 +16,7 @@
 """Transformer."""
 
 import math
+import numpy as np
 
 import torch
 import torch.nn.init as init
@@ -36,6 +37,9 @@ from .utils import split_tensor_along_last_dim
 
 from deepspeed.ops.sparse_attention import SparseSelfAttention     #TODO
 
+latencies = []
+num_layers = 0
+num_iter = 1
 
 class GPT2ParallelSelfAttention(torch.nn.Module):
     """Parallel self-attention layer for GPT2.
@@ -104,6 +108,7 @@ class GPT2ParallelSelfAttention(torch.nn.Module):
             global get_cuda_rng_tracker, checkpoint
             get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
             checkpoint = deepspeed.checkpointing.checkpoint
+        
 
 
     def _transpose_for_scores(self, tensor):
@@ -126,11 +131,14 @@ class GPT2ParallelSelfAttention(torch.nn.Module):
          mixed_key_layer,
          mixed_value_layer) = split_tensor_along_last_dim(mixed_x_layer, 3)
 
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+
         # Reshape and transpose [b, np, s, hn]
         query_layer = self._transpose_for_scores(mixed_query_layer)
         key_layer = self._transpose_for_scores(mixed_key_layer)
         value_layer = self._transpose_for_scores(mixed_value_layer)
-
 
         if self.sparsity_config is None:
             # Raw attention scores. [b, np, s, s]
@@ -167,11 +175,15 @@ class GPT2ParallelSelfAttention(torch.nn.Module):
         # [b, s, hp]
         context_layer = context_layer.view(*new_context_layer_shape)
 
+       
         # Output. [b, s, h]
         output = self.dense(context_layer)
         output = self.output_dropout(output)
 
-        return output
+        end_event.record()
+        end_event.synchronize()
+        
+        return output, start_event.elapsed_time(end_event)
 
 
 @torch.jit.script
@@ -301,13 +313,17 @@ class GPT2ParallelTransformerLayer(torch.nn.Module):
             output_layer_init_method=output_layer_init_method)
 
     def forward(self, hidden_states, ltor_mask):
+        global latencies
+        global num_layers
+        global num_iter
         # hidden_states: [b, s, h]
         # ltor_mask: [1, 1, s, s]
-
+        
+        
         # Layer norm at the begining of the transformer layer.
         layernorm_output = self.input_layernorm(hidden_states)
         # Self attention.
-        attention_output = self.attention(layernorm_output, ltor_mask)
+        attention_output, latency = self.attention(layernorm_output, ltor_mask)
         # Residual connection.
         layernorm_input = hidden_states + attention_output
         # Layer norm post the self attention.
@@ -317,6 +333,11 @@ class GPT2ParallelTransformerLayer(torch.nn.Module):
         # Second residual connection.
         output = layernorm_input + mlp_output
 
+        latencies.append(latency)
+        #print("SA latency for this layer: "+str(latency))
+        
+        print("SA mean latency: "+ str(np.mean(np.array(latencies))))
+         
         return output
 
 
@@ -416,6 +437,7 @@ class GPT2ParallelTransformer(torch.nn.Module):
             get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
             checkpoint = deepspeed.checkpointing.checkpoint
 
+       
 
     def forward(self, hidden_states, attention_mask):
 
@@ -442,7 +464,7 @@ class GPT2ParallelTransformer(torch.nn.Module):
 
         # Final layer norm.
         output = self.final_layernorm(hidden_states)
-
+        
         return output
 
 

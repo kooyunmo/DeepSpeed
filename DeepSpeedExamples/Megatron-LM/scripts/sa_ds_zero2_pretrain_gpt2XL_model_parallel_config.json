@@ -1,6 +1,5 @@
 {
-  "train_batch_size": 128,
-  "train_micro_batch_size_per_gpu": 16,
+  "train_batch_size": 32,
   "gradient_accumulation_steps": 1,
   "steps_per_print": 1,
   "optimizer": {
@@ -31,13 +30,12 @@
   },
   "wall_clock_breakdown": true,
   "sparse_attention": {
-    "mode": "fixed",
+    "mode": "variable",
     "block": 16,
     "different_layout_per_head": true,
-    "num_local_blocks": 4,
-    "num_global_blocks": 1,
     "attention": "bidirectional",
-    "horizontal_global_attention": false,
-    "num_different_global_patterns": 4
+    "num_random_blocks": 512,
+    "local_window_blocks": [16],
+    "global_block_indices": []
   }
 }
