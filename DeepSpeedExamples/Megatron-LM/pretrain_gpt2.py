@@ -16,6 +16,11 @@
 """Pretrain GPT2"""
 
 # Flag to use Pytorch ddp which uses overlapping communication and computation.
+from deepspeed.runtime.pipe import LayerSpec
+from deepspeed.runtime.pipe.topology import PipeModelDataParallelTopology
+
+from deepspeed import PipelineModule, PipelineEngine
+
 USE_TORCH_DDP = False
 
 from datetime import datetime
@@ -55,26 +60,61 @@ from gpt2_data_loader import make_gpt2_dataloaders
 from deepspeed.utils import event_manager
 from deepspeed.utils.measure import ChromeTraceRecorder
 
+
+def get_topology(args) -> PipeModelDataParallelTopology:
+    world_size = dist.get_world_size()
+    num_pp, num_mp = args.num_stages, args.model_parallel_size
+    num_pp_mp = num_pp * num_mp
+    if world_size % num_pp_mp != 0:
+        raise RuntimeError(f"World size {world_size} should be divisible by {num_pp_mp}, #PP={num_pp} times #MP={num_mp}")
+    num_dp = world_size // num_pp_mp
+    return PipeModelDataParallelTopology(num_pp=num_pp, num_mp=num_mp, num_dp=num_dp)
+
+
+def pipeline_enabled(args) -> bool:
+    return get_topology(args).get_dim('pipe') > 1 or args.force_pp
+
+def setup_pipeline(args):
+    if pipeline_enabled(args):
+        os.environ['OVERLAP_PP'] = str(bool(args.overlap_pp))
+
+def get_loss(output, label_info):
+    labels, loss_mask = label_info  # See the signature in train_step_pipe
+    losses = mpu.vocab_parallel_cross_entropy(output.contiguous().float(), labels)
+    loss_mask = loss_mask.view(-1)
+    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
+    return loss
+
+class GPT2ModelPipe(PipelineModule):
+    '''SUPER HACK: See ``deepspeed.runtime.pipe.engine#L790``'''
+
 def get_model(args):
     """Build the model."""
 
     print_rank_0('building GPT2 model ...')
-    model = GPT2Model(num_layers=args.num_layers,
-                      vocab_size=args.vocab_size,
-                      hidden_size=args.hidden_size,
-                      num_attention_heads=args.num_attention_heads,
-                      embedding_dropout_prob=args.hidden_dropout,
-                      attention_dropout_prob=args.attention_dropout,
-                      output_dropout_prob=args.hidden_dropout,
-                      max_sequence_length=args.max_position_embeddings,
-                      checkpoint_activations=args.checkpoint_activations,
-                      checkpoint_num_layers=args.checkpoint_num_layers,
-                      parallel_output=True)
+    model_kwargs = dict(num_layers=args.num_layers,
+                        vocab_size=args.vocab_size,
+                        hidden_size=args.hidden_size,
+                        num_attention_heads=args.num_attention_heads,
+                        embedding_dropout_prob=args.hidden_dropout,
+                        attention_dropout_prob=args.attention_dropout,
+                        output_dropout_prob=args.hidden_dropout,
+                        max_sequence_length=args.max_position_embeddings,
+                        checkpoint_activations=args.checkpoint_activations,
+                        checkpoint_num_layers=args.checkpoint_num_layers,
+                        parallel_output=True)
+    if pipeline_enabled(args):
+        layer_specs = GPT2Model.layer_specs(**model_kwargs)
+        model = GPT2ModelPipe(layers=layer_specs, topology=get_topology(args),
+                              loss_fn=get_loss, partition_method='parameters', num_stages=args.num_stages)
+    else:
+        model = GPT2Model(**model_kwargs)
 
     if mpu.get_data_parallel_rank() == 0:
         print(' > number of parameters on model parallel rank {}: {}'.format(
             mpu.get_model_parallel_rank(),
             sum([p.nelement() for p in model.parameters()])), flush=True)
+
 
     #To prevent OOM for model sizes that cannot fit in GPU memory in full precision
     if args.deepspeed and args.fp16:
@@ -165,13 +205,12 @@ def setup_model_and_optimizer(args):
 
     if args.deepspeed:
         print_rank_0("DeepSpeed is enabled.")
-
         model, optimizer, _, lr_scheduler = deepspeed.initialize(
             model=model,
             model_parameters=param_groups,
             args=args,
             lr_scheduler=lr_scheduler,
-            mpu=mpu,
+            mpu=mpu if not pipeline_enabled(args) else None,
             dist_init_required=False
         )
 
@@ -291,11 +330,7 @@ def forward_step(data_iterator, model, args, timers):
 
     # Forward model.
     output = model(tokens, position_ids, attention_mask)
-    losses = mpu.vocab_parallel_cross_entropy(output.contiguous().float(),
-                                              labels)
-    loss_mask = loss_mask.view(-1)
-    loss = torch.sum(losses.view(-1) * loss_mask) / loss_mask.sum()
-
+    loss = get_loss(output, (labels, loss_mask))
     return loss
 
 
@@ -316,7 +351,6 @@ def backward_step(optimizer, model, lm_loss, args, timers):
             loss.backward()
 
     # Reduce across processes.
-    lm_loss_reduced = lm_loss
 
     reduced_losses = lm_loss.view(1)
 
@@ -396,9 +430,55 @@ def train_step(data_iterator, model, optimizer, lr_scheduler,
     return lm_loss_reduced, skipped_iter
 
 
+def train_step_pipe(data_iterator, model: PipelineEngine, optimizer, lr_scheduler,
+                    args, timers):
+    def iter_wrapper(data_iterator):
+        try:
+            while True:
+                tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator, args, timers)
+                input = (tokens, position_ids, attention_mask)
+                label_info = (labels, loss_mask)
+                yield input, label_info
+        except StopIteration:
+            pass
+    wrapped_iter = iter_wrapper(data_iterator)
+
+    @model.set_batch_fn
+    def batch_mp_non_zero(batch):
+        if batch is None:
+            result = next(wrapped_iter)  # HACK: See ``deepspeed.runtime.pipe.engine#L477``
+        else:
+            result = batch
+        if result is None:
+            raise RuntimeError(f"[rank {dist.is_initialized() and dist.get_rank()}] Why? batch is None!!")
+        return result
+
+    lm_loss_reduced = model.train_batch(wrapped_iter)
+
+    return lm_loss_reduced, 0
+
+
 def train(model, optimizer, lr_scheduler,
           train_data_iterator, val_data_iterator, timers, args):
     """Train the model."""
+
+    """
+    #### EXAMPLE ####
+
+    train_iter = iter(train_loader)
+    loss = engine.train_batch(data_iter=train_iter)
+
+    The above train_batch() example is equivalent to the following with traditional data parallel DeepSpeed:
+    #### VS ####
+
+    train_iter = iter(train_loader)
+    for micro_batch in engine.gradient_accumulation_steps():
+        batch = next(data_iter)
+        loss = engine(batch)
+        engine.backward(loss)
+        engine.step()
+
+    """
 
     # Turn on training mode which enables dropout.
     model.train()
@@ -413,12 +493,12 @@ def train(model, optimizer, lr_scheduler,
     timers('interval time').start()
     report_memory_flag = True
     while iteration < args.train_iters:
-
-        lm_loss, skipped_iter = train_step(train_data_iterator,
-                                           model,
-                                           optimizer,
-                                           lr_scheduler,
-                                           args, timers)
+        train_fn = train_step_pipe if pipeline_enabled(args) else train_step
+        lm_loss, skipped_iter = train_fn(train_data_iterator,
+                                         model,
+                                         optimizer,
+                                         lr_scheduler,
+                                         args, timers)
         skipped_iters += skipped_iter
         iteration += 1
 
@@ -516,6 +596,9 @@ def evaluate(data_iterator, model, args, timers, verbose=False):
 def evaluate_and_print_results(prefix, data_iterator, model,
                                args, timers, verbose=False):
     """Helper function to evaluate and dump results on screen."""
+    '''
+    # DISABLED by AC 
+
     lm_loss = evaluate(data_iterator, model, args, timers, verbose)
     lm_ppl = math.exp(min(20, lm_loss))
     print_rank_0('-' * 100)
@@ -528,6 +611,8 @@ def evaluate_and_print_results(prefix, data_iterator, model,
     print_rank_0('-' * length)
 
     return lm_loss
+    '''
+    return 0
 
 '''
     Optional DeepSpeed Activation Checkpointing features
@@ -569,7 +654,7 @@ def initialize_distributed(args):
         init_method=init_method)
 
     # Set the model-parallel / data-parallel communicators.
-    mpu.initialize_model_parallel(args.model_parallel_size)
+    mpu.initialize_model_parallel(get_topology(args))
 
     # Optional DeepSpeed Activation Checkpointing Features
     #
@@ -649,11 +734,13 @@ def main():
     if torch.distributed.get_rank() == 0:
         print('Pretrain GPT2 model')
         print_args(args)
-    
+
     @event_manager.add_post_handler
     @event_manager.add_pre_handler
     def event_handler(event):
         torch.cuda.current_stream().synchronize()
+    
+    setup_pipeline(args)
 
     recorder = ChromeTraceRecorder(event_manager)
     recorder.enable()
@@ -661,12 +748,15 @@ def main():
         # Random seeds for reproducability.
         set_random_seed(args.seed)
 
+        # Model, optimizer, and learning rate.
+        model, optimizer, lr_scheduler = setup_model_and_optimizer(args)
+
         # Data stuff.
+        # Note (AC): got rid of confusing separate "batch_size" option. Use train_batch_size and num_accumulation_steps option instead.
+        args.batch_size = model.train_micro_batch_size_per_gpu()
         train_data, val_data, test_data, args.vocab_size, \
             args.eod_token = get_train_val_test_data(args)
 
-        # Model, optimizer, and learning rate.
-        model, optimizer, lr_scheduler = setup_model_and_optimizer(args)
 
         # Resume data loader if necessary.
         if args.resume_dataloader:

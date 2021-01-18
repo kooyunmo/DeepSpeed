@@ -5,18 +5,20 @@ Copyright 2019 The Microsoft DeepSpeed Team
 import torch.distributed as dist
 
 _groups = None
+_grad_groups = None
 _grid = None
 
 
 #initializes adjacent process groups
 #run this only after torch.distributed.init_process_group() has been called
 def init_process_groups(grid):
-    global _groups, _grid
+    global _groups, _grad_groups, _grid
     _grid = grid
 
     assert _grid.pipe_parallel_size > 1, "There is no pipeline parallelism"
 
     _groups = [dist.new_group(ranks=group) for group in _grid.p2p_groups]
+    _grad_groups = [dist.new_group(ranks=group) for group in _grid.p2p_groups]
 
 
 def _is_valid_send_recv(src_stage, dest_stage):
@@ -28,20 +30,19 @@ def _is_valid_send_recv(src_stage, dest_stage):
     "Functionality currently limited to send and receive between adjacent ranks only"
 
 
-def send(tensor, dest_stage, async_op=False):
+def send(tensor, dest_stage, async_op=False, is_grad=False):
     global _groups
 
     async_op = False
     src_stage = _grid.get_stage_id()
     _is_valid_send_recv(src_stage, dest_stage)
 
-    group = _get_send_recv_group(src_stage, dest_stage)
+    group = _get_send_recv_group(src_stage, dest_stage, is_grad)
     src_rank = _grid.stage_to_global(stage_id=src_stage)
-
     return dist.broadcast(tensor, src_rank, group=group, async_op=async_op)
 
 
-def recv(tensor, src_stage, async_op=False):
+def recv(tensor, src_stage, async_op=False, is_grad=False):
 
     global _groups
 
@@ -49,7 +50,7 @@ def recv(tensor, src_stage, async_op=False):
     dest_stage = _grid.get_stage_id()
     _is_valid_send_recv(src_stage, dest_stage)
 
-    group = _get_send_recv_group(src_stage, dest_stage)
+    group = _get_send_recv_group(src_stage, dest_stage, is_grad)
     src_rank = _grid.stage_to_global(stage_id=src_stage)
 
     return dist.broadcast(tensor, src_rank, group=group, async_op=async_op)
@@ -66,7 +67,7 @@ def barrier(stage_id):
         print("Exiting Barrier ", group_id)
 
 
-def _get_send_recv_group(src_stage, dest_stage):
+def _get_send_recv_group(src_stage, dest_stage, is_grad):
     '''the group id is always the smaller rank unless its a wrap around'''
 
     stage_id = None
@@ -87,4 +88,5 @@ def _get_send_recv_group(src_stage, dest_stage):
      '''
     group_id = _grid.stage_to_global(stage_id=stage_id)
 
-    return _groups[group_id]
+    groups = _grad_groups if is_grad else _groups
+    return groups[group_id]

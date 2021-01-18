@@ -5,16 +5,11 @@
 # DP = 4, VMP = 2
 # DP = 8, VMP = 1
 # Change for multinode config
-GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-16}
 MP_SIZE=${MP_SIZE:-8}
+PP_SIZE=${PP_SIZE:-1}
 SEQ_LENGTH=${SEQ_LENGTH:-1024}
-#export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
-NUM_WORKERS=1
-NUM_GPUS_PER_WORKER=16
-
-DP_SIZE=$(expr $NUM_GPUS_PER_WORKER / $MP_SIZE)
-LOCAL_BATCH_SIZE=$(expr $GLOBAL_BATCH_SIZE / $DP_SIZE)
+NUM_WORKERS=${NUM_WORKERS:-1}
+NUM_GPUS_PER_WORKER=${NUM_GPUS_PER_WORKER:-16}
 
 script_path=$(realpath $0)
 script_dir=$(dirname $script_path)
@@ -22,10 +17,10 @@ script_dir=$(dirname $script_path)
 config_json="$script_dir/ds_zero2_pretrain_gpt2XL_model_parallel_config.json"
 gpt_options=" \
        --model-parallel-size ${MP_SIZE} \
-       --num-layers 1 \
-       --hidden-size 12288 \
-       --num-attention-heads 96 \
-       --batch-size $LOCAL_BATCH_SIZE \
+       --num-stages ${PP_SIZE} \
+       --num-layers 48 \
+       --hidden-size 1536 \
+       --num-attention-heads 24 \
        --seq-length $SEQ_LENGTH \
        --max-position-embeddings $SEQ_LENGTH \
        --train-iters 20 \

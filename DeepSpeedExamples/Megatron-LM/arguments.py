@@ -104,8 +104,8 @@ def add_training_args(parser):
 
     group = parser.add_argument_group('train', 'training configurations')
 
-    group.add_argument('--batch-size', type=int, default=4,
-                       help='Data Loader batch size')
+    #group.add_argument('--batch-size', type=int, default=4,
+    #                   help='Data Loader batch size') # Deprecated
     group.add_argument('--weight-decay', type=float, default=0.01,
                        help='weight decay coefficient for L2 regularization')
     group.add_argument('--checkpoint-activations', action='store_true',
@@ -230,6 +230,9 @@ def add_data_args(parser):
 
     group.add_argument('--model-parallel-size', type=int, default=1,
                        help='size of the model parallel.')
+    group.add_argument('--num-stages', type=int, default=1, help='Number of Pipeline Parallel stages (by AC)')
+    group.add_argument('--force-pp', action='store_true', default=False, help='Use PipelineEngine even when num-stages is 1')
+    group.add_argument('--overlap-pp', action='store_true', default=False, help='Make PipelineEngine overlap communications with computations')
     group.add_argument('--shuffle', action='store_true',
                        help='Shuffle data. Shuffling is deterministic '
                        'based on seed and current epoch.')
@@ -304,7 +307,6 @@ def add_data_args(parser):
                        help='Maximum number of predictions to use per sequence.'
                        'Defaults to math.ceil(`--seq-length`*.15/10)*10.'
                        'MUST BE SPECIFIED IF `--use-tfrecords` is True.')
-
     return parser
 
 def get_args():

@@ -14,11 +14,13 @@
 # limitations under the License.
 
 """GPT-2 model."""
+from typing import List
 
 import torch
 import torch.nn.functional as F
 
 import mpu
+from deepspeed.runtime.pipe import LayerSpec, TiedLayerSpec
 
 
 def init_method_normal(std=0.02):
@@ -32,12 +34,94 @@ def init_method_normal(std=0.02):
     return init_
 
 
+class GPT2EmbeddingLayer(torch.nn.Module):
+    def __init__(self, vocab_size, hidden_size, init_method, max_sequence_length, embedding_dropout_prob):
+        super().__init__()
+        self.word_embeddings = mpu.VocabParallelEmbedding(vocab_size, hidden_size, init_method=init_method)
+        # Position embedding (serial).
+        self.position_embeddings = torch.nn.Embedding(max_sequence_length, hidden_size)
+        # Initialize the position embeddings.
+        init_method(self.position_embeddings.weight)
+        # Embeddings dropout
+        self.embedding_dropout = torch.nn.Dropout(embedding_dropout_prob)
+
+    @property
+    def weight(self):
+        """"weight Shared by embedding layer and logit layer"""
+        return self.word_embeddings.weight
+
+    def forward(self, input_ids, position_ids, attention_mask):
+        # Embeddings.
+        words_embeddings = self.word_embeddings(input_ids)
+        position_embeddings = self.position_embeddings(position_ids)
+        embeddings = words_embeddings + position_embeddings
+
+        # Dropout.
+        return self.embedding_dropout(embeddings), attention_mask
+
+
 class GPT2Model(torch.nn.Module):
     """GPT-2 Language model.
 
     The output of the forward method are the logits (parallel or
     serial depending on the `parallel_output` flag.
     """
+    @classmethod
+    def layer_specs(cls,
+                    num_layers,
+                    vocab_size,
+                    hidden_size,
+                    num_attention_heads,
+                    embedding_dropout_prob,
+                    attention_dropout_prob,
+                    output_dropout_prob,
+                    max_sequence_length,
+                    checkpoint_activations,
+                    checkpoint_num_layers=1,
+                    parallel_output=True) -> List[LayerSpec]:
+        assert parallel_output
+        init_method = init_method_normal(std=0.02)
+
+        # Word embeddings (parallel).
+        embd = TiedLayerSpec(
+            "embd",
+            GPT2EmbeddingLayer,
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            init_method=init_method,
+            max_sequence_length=max_sequence_length,
+            embedding_dropout_prob=embedding_dropout_prob,
+            tied_weight_attr='weight',
+        )
+
+        logit = TiedLayerSpec(
+            "embd",
+            GPT2EmbeddingLayer,
+            vocab_size=vocab_size,
+            hidden_size=hidden_size,
+            init_method=init_method,
+            max_sequence_length=max_sequence_length,
+            embedding_dropout_prob=embedding_dropout_prob,
+            forward_fn=lambda self, hidden_states: F.linear(hidden_states, self.word_embeddings.weight),
+            tied_weight_attr='weight',
+        )
+
+        # Transformer
+        inner_layer_specs = mpu.GPT2ParallelTransformer.layer_specs(
+            num_layers,
+            hidden_size,
+            num_attention_heads,
+            attention_dropout_prob,
+            output_dropout_prob,
+            checkpoint_activations,
+            checkpoint_num_layers
+        )
+
+        return [
+            embd,
+            *inner_layer_specs,
+            logit,
+        ]
 
     def __init__(self,
                  num_layers,
