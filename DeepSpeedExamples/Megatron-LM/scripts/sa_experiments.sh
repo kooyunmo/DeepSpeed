@@ -3,8 +3,8 @@
 script_path=$(realpath $0)
 script_dir=$(dirname $script_path)
 config_json="$script_dir/sa_ds_zero2_pretrain_gpt2XL_model_parallel_config.json"
-NUM_GPUS_PER_WORKER=8
-BATCH_SIZE=8
+NUM_GPUS_PER_WORKER=16
+BATCH_SIZE=1
 
 for SEQ_LEN in 256 512 1024 2048
   do
@@ -47,19 +47,13 @@ cat > ${config_json} <<-JSON
   },
   "wall_clock_breakdown": true,
   "sparse_attention": {
-    "mode": "fixed",
-    "block": 16,
-    "different_layout_per_head": true,
-    "num_local_blocks": 4,
-    "num_global_blocks": 1,
-    "attention": "bidirectional",
-    "horizontal_global_attention": false,
-    "num_different_global_patterns": 4
+    "mode": "variable",
+    "attention": "unidirectional"
   }
 }
 JSON
 
-        BATCH_SIZE=${BATCH_SIZE} MP_SIZE=${MP_SIZE} SEQ_LEN=${SEQ_LEN} bash scripts/sa_ds_zero2_pretrain_gpt2XL_model_parallel.sh |& tee mp${MP_SIZE}_sl${SEQ_LEN}.log
+        BATCH_SIZE=${BATCH_SIZE} MP_SIZE=${MP_SIZE} SEQ_LENGTH=${SEQ_LEN} bash scripts/sa_ds_zero2_pretrain_gpt2XL_model_parallel.sh |& tee mp${MP_SIZE}_sl${SEQ_LEN}.log
         gzip trace-*.json mp${MP_SIZE}_sl${SEQ_LEN}.gz
       done
   done
